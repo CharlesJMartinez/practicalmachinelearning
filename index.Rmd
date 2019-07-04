@@ -7,24 +7,136 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+require(ggplot2)
+require(lattice)
+require(caret)
+require(gbm)
+require(parallel)
+require(dplyr)
+require(doParallel)
+require(randomForest)
 ```
 
-## R Markdown
+## Executive Summary
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+The goal of this analysis is to use practical machine learning tools to create a model that will be used to predict how well an exercise was performed.
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+The data used for this analysis was provided by the project HAR.
+[Har Link](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har)
+
+The first step of the anaylisis was to understand the data and what type of data transformation was needed to make sure we were using only variables that will help on building a better model. Because or goal was to classify the quality of the exercise within 4 different values, this is considered a classification model.
+
+Once the data was clean, the next step was to decide which regression method to use, the decison was made to use Random Forest with k0fold cross validation and repetition (to reduce overfitting). The original data was also partitiones in two sets, one for trainng and another samller one for validation, allowing us to gave a cross-validation mechanism, needed to test the accuracy of the model before it was used to predict the classification values of a test set.
+
+The model build has 99.21% accuracy with an expeted out of sample error of 0.79%.
+
+## Data cleaing and pre-processing
+
+First we need to load the data.
 
 ```{r cars}
-summary(cars)
+trainigURL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testURL    <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+download.file(trainigURL, "pml-training.csv")
+download.file(testURL, "pml-testing.csv")
+
+origdata <- read.csv("pml-training.csv",  skip =0, header = TRUE, na.strings=c("NA","#DIV/0!"))
+testdata <- read.csv("pml-testing.csv",  skip =0, header = TRUE, na.strings=c("NA","#DIV/0!"))
 ```
 
-## Including Plots
+We want to check how many rows and variables we have.
 
-You can also embed plots, for example:
+```{R}
+dim(origdata)
+```
+
+We can see we have 160 variables, with 19,622 observations, that will give us a total of 3,139,520 different values.
+
+With so many variables it is important to understand if all of them will provide good information for the model, the first step to chek on this is to see how complete is the data (how many missing values we have).
+
+```{R}
+sum(is.na(origdata))
+sum(is.na(origdata))/(dim(origdata)[1]*dim(origdata)[2])
+```
+
+As we can see more than 61% of values are actually missing values, we now need to identify if there is an opportunity to do value imputation or if a variable has so many missing values that is not actually providing information for the model. We will select any variable that has more than 70% of missing values and remove those variables from the data to be used to build the model.
+
+```{R}
+na_count <- apply(is.na(origdata), 2, sum)
+na_count <- data.frame(Variable=names(na_count), NaCount= na_count, row.names = NULL)
+na_variables <- na_count[(na_count$NaCount / 19622) >= 0.7,]
+na_variables$Variable <- as.character(na_variables$Variable)
+newdata <- origdata[ , !(names(origdata) %in% na_variables$Variable)]
+length(na_variables$Variable)
+sum(is.na(newdata))
+```
+
+We can see that we no longer have missing values and We were able to eliminate 100 features (variables) from the model. 
+
+Additionally, by reading the research document of Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. [Qualitative Activity Recognition of Weight Lifting Exercises] (http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf) it is clear than the classification of the quality of the exercises with the sensor-oriented approach is based on the readings of the devices and not the date or time the exercise was performed. Based on this information I decided to eliminate the time based variables (raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp, new_window, num_window) as well as the variable that stores the number of the observation (X)
+
+```{R}
+var_torm <- c("X","raw_timestamp_part_1","raw_timestamp_part_2","cvtd_timestamp","new_window","num_window")
+newdata <- newdata[,!names(newdata) %in% var_torm]
+```
+
+## Building Prediction Model
+
+### Cross-Validation
+To be able to test our model before we use it to classify the data in the test set, we decided to split our training data into two sets, a training set used to build the model and a validation test, that will be used to calculate the accuracy of our model.
+
+```{R}
+set.seed(1021) 
+inTraining <- createDataPartition(newdata$classe, p = .80, list=FALSE)
+training <- newdata[inTraining,]
+validation <- newdata[-inTraining,]
+```
+
+### Model selection
+
+For this analysis we have the scenario where we were able to significantly reduce the number of features (variables) whie having a high number of observations. To build our model the decision was made to use random forest with 5 folds for cross validation with 10 repetitions.
+
+Using random forest significantly increases interpreatibility of the model, random forest are also inherently good to reduce overfitting, specially when they are combined with k-fold cross validation. This is particulary important in our case, we have a high number of features and reducing iverfitting is very important for our model.
+
+To improve the performance of our model training we will activate parallel processing and define a train control function that will define repeated k-fold validation for 5 folds and 10 repetitions.
+```{R}
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+fitControl <- trainControl(method = "repeatedcv",number = 5, repeats=5, allowParallel = TRUE)
+```
+We now proceed to train our model using the training data.
+```{R cache=TRUE}
+fitmodel <- train(classe ~ ., data=training, method="rf", trControl = fitControl)
+```
+And we free the session from the parallel processing.
+```{R}
+stopCluster(cluster)
+registerDoSEQ()
+```
+We now apply our model to the validation data set and calculate the accuracy we are getting.
+```{R}
+predValidate <- predict(fitmodel,validation)
+confusionMatrix(predValidate, validation$classe)
+```
+As we can see the accuracy of the model is 99.21%. The expected out of sample error will be 1 - accuracy = 1 - 0.9921 = 0.0079, or, *0.79%*.
+
+## Most Important Variables
+
+Let's take a look to the plot of most important variables.
 
 ```{r pressure, echo=FALSE}
-plot(pressure)
+varImpPlot(fitmodel$finalModel)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+We can see that the variable roll_bet si the most impritant variable, followed by pitch_forearm, yaw_belt and pitch_belt.
+
+## Applying Model to Predict Results on Test Data
+
+The final step on this analysis is to apply the model on the test data to predict the classe of the observations.
+
+```{R}
+predtest <- predict(fitmodel, testdata)
+predtest
+```
+
